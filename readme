@@ -1,0 +1,327 @@
+https://habrahabr.ru/post/186944/
+
+В этой статье я опишу процесс создания собственного системного монитора. Данный системный монитор показывает:
+Hostname
+Имя пользователя
+Uptime
+Имя модели процессора
+Частоту процессора
+Загрузку процессора
+Количество оперативной памяти
+Количество используемой оперативной памяти без кэшируемых данных
+Запущенные процессы
+
+Если кому-то в предпоследнем пунтке не понятно что значит без кэшируемых данных, то почитайте вот это, там описано что это значит. Также в этом системном мониторе реализована возможность завершения процессов.
+В результате у нас должен получится вот такой системный монитор:
+imageimage
+Теперь его основные возможности определены, и я могу приступать к описанию кода, предупреждаю сразу что код будет работать только в линуксе, так как почти все его возможности основаны на парсинге папки /proc. Свой системный монитор я разделил на три класса, в первом классе реализуется общая системная информация, во втором классе таблица процессов, ну и третий класс соединят это в одно целое. Вот каркас первого класса, я его назвал Info:
+#ifndef INFO_H
+#define INFO_H
+
+#include <QtGui>
+#include <iostream>
+#include <fstream>
+#include <pwd.h>
+#include <unistd.h>
+#include <sys/sysinfo.h>
+#include <vector>
+using namespace std;
+class Info : public QWidget
+{
+    Q_OBJECT
+public:
+    explicit Info(QWidget *parent = 0);
+private:
+    QLabel       * hostname;
+    QLabel       * user;
+    QLabel       * uptime;
+    QLabel       * proc;
+    QLabel       * freq;
+    QLabel       * cpuload;
+    QLabel       * mem;
+    QLabel       * memload;
+    QProgressBar * cpubar;
+    QProgressBar * membar;
+    QVBoxLayout  * layout;
+    QHBoxLayout  * hlayout;
+    vector<float> readCpuStats();
+    int getCpuLoad(double dt);
+public slots:
+    void update();
+};
+
+#endif // INFO_H
+
+Заголовочные файлы pwd.h и unistd.h используются для получения имени пользователя, а заголовочный файл sys/sysinfo.h для получения аптайма. Теперь опишу реализацию класса Info, она располгается в файле info.cpp. В самом начале файла info.cpp мы должны подключить info.h(каркас класса info). Конструктор класса Info выглядит следующим образом:
+Info::Info(QWidget *parent) :
+    QWidget(parent)
+{
+    hostname   = new QLabel("Hostname: ");
+    user       = new QLabel("Пользователь: ");
+    uptime     = new QLabel("Uptime: ");
+    proc       = new QLabel("Процессор: ");
+    freq       = new QLabel("Частота:");
+    cpuload    = new QLabel("Загрузка процессора: ");
+    mem        = new QLabel("Оперативная память: ");
+    memload    = new QLabel("Используемая оперативная память: ");
+    cpubar     = new QProgressBar;
+    membar     = new QProgressBar;
+    layout     = new QVBoxLayout;
+    hlayout    = new QHBoxLayout;
+
+    cpubar->setMaximumHeight(21); membar->setMaximumHeight(21);
+    hlayout->addWidget(cpuload); hlayout->addWidget(cpubar);
+    layout->addWidget(hostname); layout->addWidget(user);
+    layout->addWidget(uptime); layout->addWidget(proc);
+    layout->addWidget(freq); layout->addLayout(hlayout);
+    layout->addWidget(mem); layout->addWidget(memload);
+    layout->addWidget(membar); setLayout(layout);
+
+    update();
+
+    QTimer *timer = new QTimer;
+    connect(timer, SIGNAL(timeout()), this, SLOT(update()));
+    timer->start(2000);
+}
+
+в самом начале мы инициализируем все графические элементы. Следующим действием мы раставляем графические элементы в лэйаутах. После мы вызываем слот update для того чтобы все метки и прогрессбары заполнились значениями. Чтобы информация регулярно обновлялась мы создаём объект класса QTimer, и соединяем его сигнал timeout, с уже знакомым нам слотом update.
+Думаю логичным будет описать следующим слот update, вот его код:
+void Info::update()
+{
+    ifstream stream("/proc/sys/kernel/hostname"); string str;
+    getline(stream,str);
+    hostname->setText("Hostname: " + QString::fromStdString(str));
+    uid_t uid = geteuid();
+    passwd *pw = getpwuid(uid);
+    user->setText("Пользователь: " + QString::fromAscii(pw->pw_name));
+    struct sysinfo o;
+    sysinfo(&o);
+    long up = o.uptime;
+    int hour = up/60/60;
+    int min = (up - hour*60*60) / 60;
+    int sec =  ((up - hour*60*60) - min*60);
+    QString e = QString::number(hour) +  QString(" h. ") + QString::number(min) + QString(" m. ")
+                + QString::number(sec) + QString(" s.");
+    uptime->setText("Uptime: " + e);
+    stream.close(); stream.open("/proc/cpuinfo");
+    for(int i = 0; i < 16;i++) stream >> str;
+    getline(stream,str);
+    proc->setText("Процессор: " + QString::fromStdString(str));
+    for(int i = 0; i< 7; i++)  stream >> str;
+    freq->setText("Частота: " + QString::fromStdString(str) + " MHz");
+    cpubar->setValue(getCpuLoad(0.3));
+    stream.close(); stream.open("/proc/meminfo");
+    stream >> str; stream >> str;
+    int num = atoi(str.c_str());
+    int percent = num / 100;
+    int gb = (num / 1024) / 1024;
+    int mb = (num-gb*1024*1024) /1024;
+    int kb = (num - (gb*1024*1024+mb*1024));
+    if (gb > 0)
+       e = QString::number(gb) + QString(" Gb ");
+    else
+       e = QString("");
+    if (mb > 0)
+       e += QString::number(mb) + QString(" Mb ");
+    if (kb > 0)
+       e += QString::number(kb) + QString(" Kb ");
+    mem->setText("Оперативная память: " + e);
+    int free = 0;
+    for (int i = 0 ; i < 3 ; i++) {
+        stream >> str; stream >> str; stream >> str;
+        free += atoi(str.c_str());
+    }
+    num -= free;
+    gb = num / 1024 / 1024;
+    mb = (num - gb*1024*1024) / 1024;
+    kb = (num - ((mb*1024) + (gb * 1024 * 1024)));
+    if (gb > 0)
+       e = QString::number(gb) + QString(" Gb ");
+    else
+       e = QString("");
+    if (mb > 0)
+       e += QString::number(mb) + QString(" Mb ");
+    if (kb > 0)
+       e += QString::number(kb) + QString(" Kb ");
+    memload->setText("Используемая оперативная память: " + e);
+    percent = num / percent; membar->setValue(percent);
+}
+
+Сначала мы открываем для чтения(именно поэтому для программы не требуются права суперпользователя) файл /proc/sys/kernel/hostname и получаем имя машины, после чего мы заполняем метку hostname. после чего мы создаём экземпляр структуры passwd и uid_t, с помощью которых получаем имя пользователя для заполнения метки user. Информация о том как узнать имя пользователя была взята из исходников программы whoami. После чего мы создаём и заполняем значениями экземпляр структуры sysinfo, из которой берём информацию об аптайме системе. После чего мы связываем уже созданный поток stream с файлом /proc/cpuinfo, в котором находим информацию об имени модели процессора и его частоте. Загрузка процессора мы получаем при помощи метода getCpuLoad, который я опишу ниже. Теперь мы связываем поток stream с файлом /proc/meminfo из которого мы берём количество оперативной памяти, и приводим его к удобно читаемому виду. Потом из этого же файла мы получем количество свободной операивной памяти, а так же объём кэшированных данных. Для получения количества занятой оперативной памяти мы вычитаем из все оперативной памяти свободную оперативку и объём кэшированных данных, после опять же приводим к удобно читаемому виду. Теперь как я обещал выше описание функции getCpuLoad. Эту функцию я писал не сам(я её взял вот отсюда), поэтому очень подробного её описания я привести не могу, я опишу её в общих чертах. Вот она:
+int Info::getCpuLoad(double dt)
+{
+    vector<float> stats1 = readCpuStats();
+    QProcess::execute("sleep",QStringList() << QString::number(dt));
+    vector<float> stats2 = readCpuStats();
+    int size1 = stats1.size();
+    int size2 = stats2.size();
+    if (!size1 || !size2 || size1 != size2) return 2;
+    for (int i = 0; i < size1; ++i) stats2[i] -= stats1[i];
+    int sum = 1;
+    for (int i = 0; i < size1; ++i) sum += stats2[i];
+    int load = 100 - (stats2[size2 - 1] * 100 / sum);
+    return load;
+}
+
+мы два раза получаем три значения с помощью функции readCpuStats(её я тоже опишу ниже), но вызываем мы эту функцию с некоторым промежутком во времени. После загрузка процессора вычисляется исходя из этих значений. А вот теперь описание функции readCpuStats:
+vector<float> Info::readCpuStats()
+{
+    vector<float> ret;
+    ifstream stat_file("/proc/stat");
+    if (!stat_file.is_open())
+    {
+        cout << "Unable to open /proc/stat" << std::endl;
+        return ret;
+    }
+    int val;
+    string tmp;
+    stat_file >> tmp;
+    for (int i = 0; i < 4; ++i)
+    {
+        stat_file >> val;
+        ret.push_back(val);
+    }
+    stat_file.close();
+    return ret;
+}
+
+Эта функция была взята с того же сайта что и функция getCpuLoad. В этой функции мы считываем значения из файла /proc/stat, и заносим их в вектор, который потом возвращаем оператором return.
+Теперь класс Info написан, и можно переходит к написанию класса ProcessTable. Вот каркас этого класса:
+#ifndef PROCESSTABLE_H
+#define PROCESSTABLE_H
+
+#include <QtGui>
+#include <iostream>
+#include <fstream>
+using namespace std;
+class ProcessTable : public QWidget
+{
+    Q_OBJECT
+public:
+    explicit ProcessTable(QWidget *parent = 0);
+private:
+    QTableWidget * table;
+    QHBoxLayout* hlayout;
+    QPushButton* button;
+    QVBoxLayout* layout;
+public slots:
+    void update();
+    void kill();
+};
+
+#endif // PROCESSTABLE_H
+
+Слот update используется для заполнения таблицы, а слот kill для завершения процессов. В файле реализации этого класса вначале мы должны подключить файл с его каркасом. Теперь перехожу к описанию конструктора этого класса, вот код конструктора:
+ProcessTable::ProcessTable(QWidget *parent) :
+    QWidget(parent)
+{
+    hlayout = new QHBoxLayout;
+    button = new QPushButton("Завершить");
+    button->setToolTip("Для завершения процесса вы должны выделить его PID и нажать на кнопку \"Завершить\"");
+    connect(button,SIGNAL(clicked()),this,SLOT(kill()));
+    hlayout->addStretch();
+    hlayout->addWidget(button);
+    layout = new QVBoxLayout;
+    table = new QTableWidget;
+    update();
+    layout->addWidget(table);
+    layout->addLayout(hlayout);
+    this->setLayout(layout);
+    QTimer *timer = new QTimer;
+    connect(timer, SIGNAL(timeout()), this, SLOT(update()));
+    timer->start(4000);
+}
+
+Сначала мы инициализируем графические элементы, и компануем их, а так же соединяем сигнал clicked у кнопки «Завершить» со слотом нашего класса — kill. Так же мы вызываем слот update для заполнения таблицы, и реализуем обновление таблицы при помощи таймера. Теперь описание слота update, вот его код:
+void ProcessTable::update()
+{
+    table->setColumnCount(2);
+    table->setRowCount(0);
+    QStringList list;
+    list << "Name" << "PID";
+    table->setHorizontalHeaderLabels(list);
+    QDir * dir = new QDir("/proc");
+    list = dir->entryList(QStringList("*"),QDir::AllDirs);
+    foreach(QString str, list) {
+        if(str.toInt()) {
+            ifstream stream;
+
+            stream.open("/proc/" + str.toAscii() + "/comm");
+            string s; getline(stream,s);
+            int lastRow = table->rowCount();
+            QString icon = "/usr/share/icons/hicolor/32x32/apps/" + QString::fromStdString(s) + ".png";
+            QFile file(icon);
+            table->insertRow(lastRow);
+            table->setColumnWidth(0,150);
+
+            if(!file.exists()) {
+                icon = ":/binary.png";
+            }
+            table->setItem(lastRow,0,new QTableWidgetItem(QPixmap(icon),QString::fromStdString(s)));
+            table->setItem(lastRow,1,new QTableWidgetItem(str));
+        } else {
+            continue;
+        }
+    }
+}
+
+Сначала мы устанавливаем количество столбцов и строк с таблице, а так же имена столбцов. После чего мы получаем список директорий в папке /proc. Для заполнения таблицы мы циклом проходим по всему списку, пропуская директории которые не принадлежат процессам. Имя процесса мы получаем из файла /proc/pid/comm. Иконку мы берём из папки /usr/share/icons/hicolor/32x32/apps, а если иконки там не будет то используется вшитая в бинарник картинка binary.png. Вот эта картинка:
+image
+Для того чтобы зашить её в исходник я использовал rcc, об использовании rcc можно почитать в книге Макса Шлее — «Qt — профессиональное программирование на C++», или можете погуглить, я думаю что в интернете много манов по использованию rcc.
+Теперь переходу к описанию слота kill, вот его код:
+void ProcessTable::kill()
+{
+    QList<QTableWidgetItem*> list = table->selectedItems();
+    QTableWidgetItem* item = list.value(0);
+    QString str = item->text();
+    QProcess::execute("kill", QStringList() << str);
+    update();
+}
+
+Для завершения процесса я использую программу которая есть во всех линуксах(если в вашем линуксе её нету, то я даже не представляю что это за линукс такой), для запуска этой программы я пользуюсь методом execute класса QProcess, второй аргумент этой функции, это список параметров для программы, я передаю только PID процесса который нужно завершить, после вызова этой программы я обновляю таблицу чтобы завершённый процесс исчез из неё. Теперь я перехожу к описанию класса SystemMonitor, в котором я соединяю эти два класса. Каркас данного класса совсем простой:
+#ifndef SYSTEMMONITOR_H
+#define SYSTEMMONITOR_H
+
+#include <QtGui>
+#include "info.h"
+#include "processtable.h"
+class SystemMonitor : public QWidget
+{
+    Q_OBJECT
+public:
+    explicit SystemMonitor(QWidget *parent = 0);
+};
+
+#endif // SYSTEMMONITOR_H
+
+Ну, метод в этом классе всего один, поэтому я сейчас его опишу. Вот код этого метода-конструктора(добавьте в начало файла реализации подключение файла каркаса):
+SystemMonitor::SystemMonitor(QWidget *parent) :
+    QWidget(parent)
+{
+    QTabWidget * tab = new QTabWidget;
+    Info* info = new Info;
+    ProcessTable* pt = new ProcessTable;
+    tab->addTab(info,"Информация о системе");
+    tab->addTab(pt,"Процессы");
+    QVBoxLayout * layout = new QVBoxLayout;
+    layout->addWidget(tab);
+    this->setLayout(layout);
+    this->show();
+}
+
+В конструкторе мы просто создаём виджет вкладок, и добавляем туда наш виджет с информацией, и виджет с таблицей, так как в качестве агрумента метод addTab принимает виджет, то для этого мы и наследовали классы Info и ProcessTable от QWidget. И сейчас последний штришок, создание отправной точки программы, то есть файла main.cpp. Вот его код:
+#include "systemmonitor.h"
+int main(int argc,char** argv)
+{
+    QTextCodec::setCodecForLocale(QTextCodec::codecForName("UTF-8"));
+    QTextCodec::setCodecForTr(QTextCodec::codecForName("UTF-8"));
+    QTextCodec::setCodecForCStrings(QTextCodec::codecForName("UTF-8"));
+    QApplication app(argc,argv);
+    QStyle * style = QStyleFactory::create("Cleanlooks");
+    app.setStyle(style);
+    SystemMonitor sys;
+    return app.exec();
+}
+
+Первые три строки делают так, чтобы русские буквы в программе корректно отображались. Строки 8 и 9 обеспечивают что в любой системе наше приложение будет выглядеть одинаково.
+Ну вот и всё, системный монитор готов, Всем пока!
